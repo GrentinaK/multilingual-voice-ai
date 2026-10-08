@@ -19,14 +19,17 @@ app = modal.App("multilingual-stt")
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install(
-        "faster-whisper",
-        "fastapi",
-        "numpy<2",
-        "uvicorn[standard]",
+        # Pinned to the versions verified working; ctranslate2 is
+        # faster-whisper's engine and decides which CUDA libraries it needs.
+        "faster-whisper==1.2.1",
+        "ctranslate2==4.8.2",
+        "fastapi==0.142.4",
+        "numpy==1.26.4",
+        "uvicorn[standard]==0.54.0",
         # CTranslate2 (used by faster-whisper) loads cuBLAS/cuDNN for
         # CUDA 12 at runtime; debian_slim doesn't ship them.
-        "nvidia-cublas-cu12",
-        "nvidia-cudnn-cu12==9.*",
+        "nvidia-cublas-cu12==12.9.2.10",
+        "nvidia-cudnn-cu12==9.27.0.42",
     )
     .env(
         {

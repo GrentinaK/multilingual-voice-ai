@@ -33,9 +33,9 @@ bot_image = (
         # Pinned: an unpinned rebuild pulled in breaking changes (VAD,
         # TTS and transport APIs) that failed silently.
         "pipecat-ai[webrtc,openai,silero,local-smart-turn,kokoro]==1.12.0",
-        "websockets",
-        "loguru",
-        "fastapi[standard]",
+        "websockets==17.2",
+        "loguru==0.7.3",
+        "fastapi[standard]==0.142.4",
     )
     # Bake the Kokoro model into the image instead of downloading it at
     # the start of every session.

@@ -15,9 +15,11 @@ image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("git", "ffmpeg")
     .pip_install(
-        "git+https://github.com/resemble-ai/chatterbox.git",
-        "fastapi[standard]",
-        "uvicorn[standard]",
+        # Pinned to the commit verified working.
+        "git+https://github.com/resemble-ai/chatterbox.git"
+        "@5de7a54aa4e5e2baadb0182dde554908b48b85c2",
+        "fastapi[standard]==0.142.3",
+        "uvicorn[standard]==0.54.0",
     )
 )
 
