@@ -1,0 +1,10 @@
+@import "@pipecat-ai/voice-ui-kit/styles";
+
+:root {
+  --color-agent: #80ec66;
+  --color-client: oklch(66.7% 0.295 322.15);
+}
+
+.dark {
+  --color-agent: #80ec66;
+}
