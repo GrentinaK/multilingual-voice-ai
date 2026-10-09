@@ -453,10 +453,102 @@ Swahili is a separate question.
   (ms per character) is what showed the CPU difference between containers.
   Averaged over the whole run it just looked like "TTS is sometimes slow".
 
+## Comparison with Modal's reference implementation
+
+Reviewed on 2026-10-09 against Modal's
+[open-source-av-ragbot](https://github.com/modal-projects/open-source-av-ragbot)
+(commit `d91004f`), the template this project started from. Its RAG,
+avatar and two-speaker features were ignored; only the voice pipeline,
+infrastructure and code were compared.
+
+**Verdict: the same architecture, with model choices that fit a
+multilingual goal better. Modal's version adds four infrastructure
+techniques worth adopting, snapshots above all.**
+
+### Where we match
+
+| Part | Reference | Ours |
+|---|---|---|
+| One bot container per call (`max_inputs=1`, 30 min limit) | ✓ | ✓ |
+| Frontend spawns the bot and swaps offer/answer through an ephemeral Modal Dict | ✓ | ✓ (same code) |
+| Model servers as websocket servers behind `modal.forward` tunnels | ✓ | ✓ |
+| `ModalTunnelManager` handing over the tunnel URL with an `is_running` flag | ✓ | ✓ |
+| Silero VAD + smart-turn v3; 16 kHz in, 24 kHz out | ✓ (VAD stop 0.2 s) | ✓ (0.3 s) |
+| LLM: Qwen3-4B-Instruct-2507 on vLLM, chunked prefill, `--max-num-seqs 1`, prefix caching, served as `llm` | ✓ | ✓ (nearly identical flags) |
+| All model connections started in parallel at session start | ✓ | ✓ |
+
+### Where we differ, and which fits this project
+
+| Topic | Reference | Ours | Assessment |
+|---|---|---|---|
+| The second-offer bug | Hit the same bug. Fixed in the **browser**: a fork of `small-webrtc-transport` 1.7.0 that never renegotiates (both the ICE-gathering reconnect and the server's renegotiate request are commented out), and a reconnect timer stretched from 5 s to 5 min "to account for cold-start times" | Fixed on the **server**: offers carrying a `pc_id` are routed to the running bot through a Modal Queue | Ours: keeps the standard, upgradeable library and still supports renegotiation |
+| Pipecat version | 0.0.92, pinned (older API: VAD on `TransportParams`, `OpenAILLMContext`, `run_tts(text)`) | 1.12.0, pinned | Both fine when pinned; theirs never broke because it was pinned from the start |
+| Speech-to-text | NVIDIA Parakeet TDT 0.6B v3 (NeMo) on an L40S | faster-whisper `large-v3-turbo` on an L4 | Whisper: Parakeet covers English and 24 European languages, not Swahili |
+| Text-to-speech | Kokoro on its own L40S GPU, behind a websocket, **streaming audio in chunks**, speed 1.35 | Kokoro in the bot container on CPU, one sentence at a time | Both reasonable. Ours removes a container, a hop and a cold start; theirs avoids the CPU variance and long-sentence timeout measured here |
+| GPUs | L40S (STT, TTS), H100 (LLM) | L4 everywhere | L4 is enough for one conversation: 28.6 tokens/s is several times speaking speed, 0.15–0.4 s to first token |
+| Reaching the LLM | Through a tunnel, like STT: no permanent public endpoint | Public `@app.server` endpoint, `unauthenticated=True` | Theirs: closes our open security issue |
+| Max context | 16,384 tokens, `--gpu-memory-utilization 0.25` (H100) | 8,192 tokens | Ours is ample for a short spoken conversation |
+| Who speaks first | The bot greets on connect (an `LLMRunFrame` queued on "client ready") | The bot waits for the user | Product choice |
+
+Both share two bugs inherited from the template: the STT server reads
+Pipecat's WAV segments as raw audio (~1.4 ms of noise per segment), and the
+frontend calls `logger` without importing it (fixed here on day one).
+
+### What the reference does that we don't
+
+1. **Snapshots everywhere: their main cold-start technique.** The bot, STT,
+   TTS and LLM all set `enable_memory_snapshot=True`; the GPU services also
+   set `experimental_options={"enable_gpu_snapshot": True}`. Each class
+   splits startup into `@modal.enter(snap=True)` (load and warm the model;
+   Modal saves this state) and `@modal.enter(snap=False)` (start the web
+   server and tunnel after a restore). Their SGLang LLM option also releases
+   GPU memory before the snapshot and resumes it after, and their README
+   recommends it for "faster cold starts with GPU snapshots".
+
+   Their own README notes that snapshots add "extra start up time for the
+   first few containers when the apps are (re-)deployed". So the two
+   approaches complement each other: **building work into the image (Step A)
+   speeds up the first cold start; snapshots speed up the ones after it.**
+2. **One region for every service.** `SERVICE_REGIONS = ['us-east']` is
+   applied to all apps, keeping the bot, STT, TTS and LLM close together.
+   Ours aren't pinned, so per-turn traffic between them may cross regions.
+3. **Model servers shared across calls.** `@modal.concurrent(max_inputs=20)`
+   on STT and `10` on TTS let one GPU container serve many calls. Ours
+   defaults to one call per Whisper GPU. Adopting it also means moving
+   Whisper's blocking `transcribe` off the server's event loop.
+4. **Warm-up before the snapshot.** Parakeet transcribes ten 1-second chunks
+   of sample audio and Kokoro runs six warm-up generations during startup.
+   We warm up Chatterbox but not Whisper.
+
+Smaller differences: aggressive `scaledown_window=10` s on the snapshotted
+STT and SGLang services (cheap to restart); a voice speed of 1.35; and text
+substitutions to fix pronunciation of a few words.
+
+### What to adopt, in order
+
+| # | Change | Effort | Expected effect |
+|---|---|---|---|
+| 1 | Pin all apps to one region, near the user | Very low | Lower per-turn network delay |
+| 2 | Memory snapshot for the bot container, with Kokoro and the VAD/turn models loaded in the snapshot step | Low | Cuts the ~8 s bot start that dominates warm connects |
+| 3 | `@modal.concurrent` on Whisper, with `transcribe` in a worker thread | Low–medium | One GPU serves many calls |
+| 4 | GPU snapshots for Whisper and vLLM, on top of Step A | Medium | Faster cold starts after the first |
+| 5 | Reach the LLM through a tunnel, or add authentication | Medium | Closes the public-endpoint issue |
+| 6 | Strip the WAV header on the Whisper server | Trivial | Removes the per-segment noise |
+
+Not adopting: Parakeet (no Swahili), H100s (cost without a meaningful gain
+for one user), the forked browser library (our server fix is cleaner), and
+the older Pipecat version.
+
 ## Next
 
-1. Fixes found in the measured sessions, each re-measured with the same
-   scripts:
+1. Fixes found in the measured sessions and the reference comparison, each
+   re-measured with the same scripts:
+   - Pin all apps to one region.
+   - Memory snapshot for the bot container.
+   - `@modal.concurrent` on Whisper, with `transcribe` in a worker thread.
+   - GPU snapshots for Whisper and vLLM.
+   - Reach the LLM through a tunnel, or add authentication.
+   - Strip the WAV header on the Whisper server.
    - Cold start, Step B: the remaining `torch.compile` (~55–60 s) and imports
      (~50 s); then a full end-to-end cold test after the LLM scales to zero.
    - Whisper: download the model during the image build.
