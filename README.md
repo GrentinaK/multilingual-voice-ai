@@ -210,7 +210,9 @@ no change in generation speed (28.6 → 28.8 tokens/s). The rest is mostly
   [FINDINGS.md](FINDINGS.md).
 - **Turn detection often waits 3 s** when the user trails off, and
   occasionally answers before they've finished.
-- **The bot's audio sometimes breaks up.** Cause not yet identified.
+- **The bot's audio broke up in one test, intermittently.** It wasn't heard
+  in the next test, with no change to the audio code in between, which points
+  to network or host conditions; cause not yet identified.
 - **Barge-in feels slow.** The bot stops within ~5 ms of detecting speech,
   but detection needs 0.2 s of confident speech, and echo cancellation on
   laptop speakers can delay it further.
@@ -228,8 +230,8 @@ no change in generation speed (28.6 → 28.8 tokens/s). The rest is mostly
 
 1. Finish cutting the cold start (LLM compilation, Whisper's model download,
    a warm pool of bot containers).
-2. Tune turn detection, barge-in, and sentence length, and fix the choppy
-   audio.
+2. Tune turn detection, barge-in, and sentence length; watch for the
+   intermittent choppy audio.
 3. Build the same assistant with LiveKit Agents and compare the two.
 4. Multilingual support and code-switching: an LLM and TTS that are strong
    beyond English, and rules for switching languages within a conversation.

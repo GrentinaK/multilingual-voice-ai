@@ -355,16 +355,23 @@ character** in the second (the benchmark gave 14). The slow container was
 slow from its first turn; it didn't degrade. Modal's `cpu` setting reserves
 CPU time but not a particular CPU type.
 
-### The bot's audio breaks up, cause not yet known
-The user heard the bot "breaking up" in **both** sessions. The second ran on
-the fast container, so slow CPU is at most a contributing factor, not the
-cause. The server logs show no warnings and each reply plays as one
-continuous stretch, so the server side gives no clue.
+### The bot's audio broke up in test 1, not in test 2; cause unknown
+In test 1 the user heard the bot "breaking up" in **both** sessions. The
+second of those ran on the fast container, so slow CPU is at most a
+contributing factor, not the cause. The server logs show no warnings and each
+reply plays as one continuous stretch, so the server side gives no clue.
 
-Remaining candidates: network loss or jitter between the browser and Modal
-(us-east, direct UDP via STUN, no TURN relay), or the pacing of audio sent
-by the Python WebRTC stack (aiortc). Next step: capture
-`chrome://webrtc-internals` during a session. Packet loss, jitter, and
+In test 2 the audio was clean in both sessions. **Nothing in the audio path
+changed between the tests**: the bot, `app.py` and the client were last
+changed on 2026-10-07, before test 1; the only deployed change was Step A,
+on the LLM server. So the problem went away on its own rather than being
+fixed, which points to something intermittent outside our code: network
+conditions between the browser and Modal (us-east, direct UDP via STUN, no
+TURN relay), or the host the bot container landed on. TTS speed in test 2 was
+even across containers (17–19 ms per character), unlike test 1.
+
+Status: not seen since; treat as intermittent. If it returns, capture
+`chrome://webrtc-internals` during that session: packet loss, jitter, and
 concealed samples on the incoming audio separate a network problem from a
 server one.
 
@@ -556,7 +563,8 @@ the older Pipecat version.
    - Long sentences: a longer Kokoro `stop_frame_timeout_s`, and shorter
      replies.
    - Barge-in: test with headphones, then a lower VAD `start_secs`.
-   - Choppy audio: capture `chrome://webrtc-internals` during a session.
+   - Choppy audio (intermittent; not seen in test 2): if it returns, capture
+     `chrome://webrtc-internals` during that session.
    - Put today's date in the system prompt; web search for recent facts
      later.
    - A warm pool of bot containers, to cut session start.
