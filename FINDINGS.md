@@ -4,7 +4,8 @@ Running notes from building a real-time voice assistant on Modal, grouped
 into runtime, infrastructure, and developer tools. Each finding gives the
 symptom we saw, the cause, and what we did about it.
 
-Last updated: 2026-10-07 (English baseline, Pipecat implementation).
+Last updated: 2026-10-09 (English baseline, Pipecat implementation; two
+measured test sessions and the first cold-start fix).
 
 ## Current setup
 
@@ -17,18 +18,108 @@ Last updated: 2026-10-07 (English baseline, Pipecat implementation).
 | Turn-taking | Silero VAD (0.3 s stop) + Pipecat smart-turn v3 | In-process |
 | Client | Pipecat voice-ui-kit console (React) | Static files served from Modal |
 
-Not in use, kept for the Swahili work: Chatterbox multilingual TTS on an L4
-GPU (`server/tts.py`, `modal_chatterbox_service.py`).
+Not in use, kept for the multilingual work: Chatterbox multilingual TTS on an
+L4 GPU (`server/tts.py`, `modal_chatterbox_service.py`).
 
-## Latency baseline
+## How the setup evolved
 
-Per-stage time to first output, from one English session (Pipecat metrics):
+The first working version (2026-10-07) and the current one (2026-10-09):
 
-| Stage | Average | Worst | Samples |
-|---|---|---|---|
-| STT (Whisper, one segment) | 0.90 s | 1.84 s | 6 |
-| LLM (time to first token) | 1.09 s | 1.56 s | 4 |
-| TTS (Kokoro, first audio) | 0.79 s | 1.07 s | 2 |
+| | Initial setup | Current setup |
+|---|---|---|
+| Language | Swahili and English, Whisper picks per segment | English, Whisper forced to English |
+| Text-to-speech | Chatterbox multilingual, own L4 GPU container | Kokoro-82M, in the bot container on CPU |
+| LLM image | Weights downloaded from Hugging Face at every start; FlashInfer compiled a kernel at every start | Weights built into the image (pinned revision); FlashInfer sampler off |
+| Dependencies | Unpinned; a rebuild pulled in Pipecat 1.12 | All pinned to verified versions |
+| VAD and turn detection | Silently ignored (set where 1.12 no longer reads them) | Set on the user aggregator |
+| STT container timeout | Modal default, 300 s (sessions died at 5 min) | 30 min |
+
+What that changed, as measured:
+
+| Measure | Initial setup | Current setup |
+|---|---|---|
+| **LLM container start → ready** | **281 s** | **121–138 s** |
+| Click Connect → ready, everything cold | ~5 min 20 s | not yet measured end to end; the LLM part is now ~2 min |
+| Click Connect → ready, GPUs warm | ~12 s (server side) | 17 s (browser side) |
+| Click Connect → ready, only Whisper cold | — | 32 s (browser side) |
+| TTS, time to first audio | 2.5–3.2 s (Chatterbox) | 0.7–1.1 s median (Kokoro) |
+| User stops → bot speaks, median | ~5.7 s (one Chatterbox turn) | 4.4–4.6 s |
+
+"Server side" is from the bot's logs; "browser side" is from the client's
+event log and includes starting the bot container. The cold end-to-end
+number for the current setup still needs a test after the LLM has scaled to
+zero.
+
+## Latency measurements
+
+Two test sessions, English, natural conversation with pauses, trailing off,
+and interruptions. Numbers come from the bot's logs and Pipecat metrics; the
+parser is described under Developer tools.
+
+### Test 1 (2026-10-08): one cold start (13 turns) and one warm reconnect (4 turns)
+
+#### Session start (click Connect → agent ready)
+
+| | Time | Where it goes |
+|---|---|---|
+| Cold (nothing running) | **~5 min 20 s** | almost all waiting for the LLM container (see Infrastructure) |
+| Warm (STT and LLM containers still up) | **~12 s** | ~8 s booting a fresh bot container (one per session), the rest WebRTC setup |
+
+#### Per turn (17 turns)
+
+| Measure | Median | p90 | Min | Max |
+|---|---|---|---|---|
+| **End-to-end** (user stops speaking → bot audio starts) | **4.43 s** | 6.19 s | 1.53 s | 6.82 s |
+| Speech end → turn declared over (includes STT) | 1.26 s | 3.30 s | 0.52 s | 3.39 s |
+| STT, per segment (warm, forced English) | 0.25 s | 0.28 s | | 0.44 s |
+| LLM, time to first token | 0.41 s | 0.62 s | 0.39 s | 1.97 s (first turn) |
+| TTS, time to first audio | 1.07 s | 2.13 s | | 2.46 s |
+
+"User stops speaking" is estimated as the end of the last VAD segment minus
+the 0.3 s VAD pause.
+
+What the numbers say:
+- **Deciding the turn is over is the biggest and most variable cost.** It
+  takes either ~0.5 s or ~3.3 s, nothing in between (see Runtime: smart-turn
+  fallback). Removing the 3.3 s cases alone would bring the median close to
+  2.5 s.
+- **TTS is second**, and depends on which machine the bot lands on (see
+  Infrastructure: CPU varies between containers).
+- **STT and the LLM are fast once warm** (0.25 s and 0.41 s medians).
+- Interruptions (3 turns) worked: the bot stopped and answered the new turn.
+
+### Test 2 (2026-10-09): two warm-GPU sessions (18 turns)
+
+The LLM was still warm from a benchmark, so neither session was a full cold
+start; in the first, Whisper started cold.
+
+| Measure | Median | p90 | Min | Max |
+|---|---|---|---|---|
+| **End-to-end** (user stops speaking → bot audio starts) | **4.55 s** | 5.57 s | 1.53 s | 6.32 s |
+| Speech end → turn declared over (includes STT) | 3.28 s | 3.37 s | 0.59 s | 3.43 s |
+| STT, per segment | 0.37 s | 0.48 s | 0.29 s | 0.67 s |
+| LLM, time to first token | 0.37 s | 0.52 s | 0.32 s | 1.61 s (first turn) |
+| TTS, time to first audio | 0.70 s | 1.71 s | | 3.10 s |
+
+| Session start (browser side) | Time |
+|---|---|
+| Whisper cold, LLM warm | 32 s (16 s to "connected", 16 s more for Whisper) |
+| Everything warm | 17 s (almost all starting the bot container) |
+
+What this session added:
+- **Turn detection dominated**: 11 of 18 turns waited out the 3 s smart-turn
+  fallback (6 of 17 in test 1), so the median turn-end time rose to 3.28 s.
+- **The conversation itself held up**: "Can you say that again?" got a repeat,
+  and "Finish what you wanted to tell me about going out first" picked the
+  earlier topic back up after an interruption. The user interrupted 7 times
+  and every one worked.
+- **TTS speed was even across both containers** (17–19 ms per character),
+  unlike test 1 (13–14 vs 27–52).
+- **The long-sentence problem became a reliability problem** (see Runtime:
+  audio contexts), and a fragmented transcript reversed a meaning (see
+  Runtime: VAD pause length).
+
+### Earlier comparison: Chatterbox vs Kokoro
 
 The TTS switch was the biggest single gain:
 
@@ -39,12 +130,8 @@ The TTS switch was the biggest single gain:
 | Model load | 30–40 s | 1.7 s |
 | First generation after load | 23 s (warm-up) | no warm-up seen |
 
-End-to-end delay (user stops speaking → bot starts speaking) went from about
-5.7 s with Chatterbox to a subjectively much shorter delay with Kokoro. It has
-not yet been measured across many turns; that's the next measurement to make.
-
-Not yet measured: cold-start time for a full session, and how latency changes
-over a longer conversation.
+One Chatterbox turn measured about 5.7 s end-to-end, against the 4.43 s
+median above.
 
 ## Runtime (Pipecat)
 
@@ -92,6 +179,16 @@ A TTS audio context is closed when no audio arrives within
 that returns a whole sentence at once (Chatterbox, about 3 s) needs this set
 well above its per-sentence time; ours was 1 s.
 
+It caught Kokoro too, which uses the default limit of 3 s. In test 2 the LLM
+produced a 209-character first sentence; Kokoro took 3.07 s, Pipecat gave up
+at 3 s ("TTS context … completed with no audio", shown as an error in the
+client), and the audio arrived 0.04 s later. Pipecat reopened the context and
+the reply played, but only just. Kokoro's time grows with sentence length, so
+long sentences are both slow to start and at risk of being dropped. Fixes: a
+longer `stop_frame_timeout_s` for Kokoro, and keeping the LLM's sentences
+short (the prompt asks for one or two short sentences; Qwen doesn't always
+comply).
+
 ### VAD pause length trades speed for transcript quality
 With a segmented STT, each VAD segment is transcribed separately.
 - At 0.2–0.3 s, sentences are split into fragments ("setting up my" /
@@ -100,6 +197,57 @@ With a segmented STT, each VAD segment is transcribed separately.
 
 The smart-turn model still decides when the whole turn is over, so the LLM gets
 the full turn either way; only transcription accuracy suffers. Currently 0.3 s.
+In both tests one turn was split into as many as 8 segments.
+
+Accuracy loss can change the meaning. In test 2 the user said things had not
+been working smoothly; Whisper heard "and things have not been worried." and
+"working smoothly." as separate segments, and the bot answered "That's great
+to hear!". Options: a longer pause (fewer fragments, later replies),
+re-transcribing the whole turn once it ends (more accurate, adds delay), or a
+streaming STT that keeps context across the turn.
+
+### Smart-turn's 3-second fallback makes turn-ending bimodal
+When the smart-turn model judges a turn complete, the bot moves on about
+0.5 s after the user stops. When it judges the turn *incomplete* (the user
+trailed off: "I wonder what I should do today…", "So…"), it waits for
+`SmartTurnParams.stop_secs`, which defaults to **3 s**. Together with the
+0.3 s VAD pause, that's the 3.3 s seen in 6 of 17 turns in test 1 and 11 of
+18 in test 2, and those are most of the slow end-to-end turns. The model also
+errs the other way: "Okay, I forgot to…" was judged complete and answered
+after 0.65 s, cutting the user off. Lowering `stop_secs` (e.g. to 1.5–2 s)
+trades fewer long waits for more cases of cutting the user off; not yet
+tuned.
+
+### Barge-in: the server reacts in ~5 ms; the delay is in detecting speech
+The user noticed the bot takes a moment to stop when interrupted. From the
+logs, once Pipecat registers "user started speaking", the bot stops within
+3–14 ms (one case 288 ms) across 9 interruptions. After that, at most one
+40 ms chunk of audio is still queued for sending: SmallWebRTC's sender waits
+for each chunk to go out before queuing the next.
+
+So the delay is before detection, which the logs can't time (they don't
+record when the user actually began speaking). Known contributors:
+- Silero VAD needs **0.2 s** of confident speech (`start_secs`, confidence
+  0.7, minimum volume 0.6) before it fires. These are Pipecat's defaults,
+  unchanged by us.
+- The user was on the **laptop speakers**. Browser echo cancellation lowers
+  the mic while the bot plays, which can delay reaching VAD's thresholds.
+- The user's audio travels to Modal's us-east region first.
+
+Moving VAD into the user aggregator (required by Pipecat 1.12) didn't change
+these. To separate them: barge in with headphones (if faster, echo
+cancellation is the main factor), then try `start_secs` ≈ 0.1 s (faster, but
+coughs and noise interrupt more).
+
+### The LLM doesn't know today's date or recent events
+Asked the date, Qwen answered "Thursday, June 20, 2024" in test 1 and
+"April 5, 2024" in test 2, each time with confidence, and named a president
+from its training data. Its training data ends in 2024, so it has
+no way to know either. Two different problems, two different fixes:
+- **The date** doesn't need a search: the server knows the current date and
+  can put it in the system prompt at the start of each session.
+- **Recent facts** (news, who holds an office) need a live source, such as a
+  web-search tool the LLM can call. Qwen3 supports tool calling through vLLM.
 
 ### Known issues, not yet fixed
 - Custom services log `TTSSettings/STTSettings ... NOT_GIVEN` errors at
@@ -108,6 +256,117 @@ the full turn either way; only transcription accuracy suffers. Currently 0.3 s.
   reports dangling tasks.
 
 ## Infrastructure (Modal)
+
+### The LLM cold start is ~5 minutes, and model size is a small part of it
+Measured on two cold vLLM containers (vLLM 0.21, Qwen3-4B, L4); total
+4 min 50 s and 4 min 48 s. Second boot:
+
+| Step | Time | What drives it |
+|---|---|---|
+| Container scheduled and started | 8 s | Modal |
+| Python imports and model config | 54 s | Software: vLLM and PyTorch are imported twice (API server and engine process) from a fresh disk |
+| Downloading weights (7.5 GB) | 31 s | **Model size** |
+| Loading weights onto the GPU | 4 s | **Model size** |
+| `torch.compile` | 58 s | Software: vLLM compiles the model graph for speed |
+| **FlashInfer compiling its sampling kernel** | **108 s** | Software: FlashInfer builds a GPU kernel from source on first use |
+| KV cache, CUDA graphs, server start | ~10 s | |
+| **Total** | **4 min 48 s** | |
+
+The 108 s step logs nothing. It was identified from file timestamps inside
+the running container: FlashInfer's `cached_ops/sampling` folder was written
+the exact second vLLM resumed logging. It happens because the image is
+NVIDIA's CUDA *devel* image, which includes the compiler, so FlashInfer
+compiles instead of failing over to a prebuilt kernel. vLLM only uses it for
+top-p/top-k sampling.
+
+Root cause, in order of weight:
+1. **The serving stack does one-time preparation at every start (~60%).**
+   `torch.compile` and FlashInfer's kernel build are investments that pay off
+   on a long-running server. They're unrelated to model size.
+2. **The architecture repeats all of it every time.** With scale-to-zero,
+   each container starts from the image alone: no downloaded weights, no
+   compiled graphs, no compiled kernels survive from the previous container.
+   This is the reason the work is repeated, not the work itself.
+3. **Model size is only ~12%** (download plus load, 35 s). A bigger model
+   would grow this part, but not the rest.
+
+#### Step A: weights in the image, FlashInfer sampler off (2026-10-09)
+Changes in `server/llm.py`: download the weights during the image build
+(pinned model revision), set `HF_HUB_OFFLINE=1` at runtime, and set
+`VLLM_USE_FLASHINFER_SAMPLER=0`. Measured with `tools/llm_coldstart.py` and
+the container logs:
+
+| | Before | Step A |
+|---|---|---|
+| Container start → vLLM ready | 281 s | **121 s, 138 s** (two boots) |
+| Model loading (download + load) | 41 s | 7–8 s |
+| FlashInfer kernel build | 108 s | gone |
+| `torch.compile` | 58 s | 53–61 s (unchanged) |
+| Generation speed | 28.6 tok/s | 28.8 tok/s |
+| Time to first token (5 requests) | 0.149 s | 0.241 s |
+
+About 55% off the cold start, with no change in generation speed. The time
+to first token moved from 0.15 s to 0.24 s, but with five samples and one
+outlier it may be noise; not confirmed. What's left is mostly the imports
+(~50 s) and `torch.compile` (~55–60 s).
+
+Measuring this taught two things about Modal:
+- **A deploy replaces warm containers immediately.** Deploying a new version
+  started new-version containers to replace the running one, so a "cold
+  start" right after a deploy may already be in progress.
+- **Stopping a container gets it replaced** while the app is inside its
+  scale-down window (15 min here): the autoscaler keeps the capacity it last
+  needed. A true request-to-ready cold start can only be measured after the
+  window runs out. Container start → "Starting vLLM server" in the logs is a
+  workable stand-in (it measured 281 s where the request-based number was
+  290 s).
+
+Ways to cut it further, by what they remove:
+- Persist `~/.cache/huggingface`, `~/.cache/vllm`, and `~/.cache/flashinfer`
+  on a Modal Volume: removes the download and most compilation on later cold
+  starts (they still run once, to fill the cache).
+- Turn off the FlashInfer sampler (`VLLM_USE_FLASHINFER_SAMPLER=0`): removes
+  the 108 s outright, at a sampling speed cost that should be negligible for
+  one conversation at a time. Not yet measured.
+- `--enforce-eager`: skips compilation and CUDA graphs, but makes generation
+  slower every turn.
+- Modal memory snapshots: could also cut the 54 s of imports.
+- `min_containers=1`: no cold start at all, at the cost of an always-on GPU.
+
+### Every session boots a new bot container (~8 s)
+The bot class allows one session per container (`max_inputs=1`), so even a
+"warm" connect waits ~8 s for a new CPU container to start. That's now the
+floor for session start. Seen from the browser in test 2, a fully warm
+connect took 17 s, almost all of it before the client even reached
+"connected" (the `/offer` request waiting for the new bot container). A warm
+pool of bot containers (`min_containers`/`buffer_containers`) would remove
+it cheaply, since they're CPU only.
+
+### Whisper also downloads its model on every cold start
+The STT container logs "unauthenticated requests to the HF Hub" at every
+start: faster-whisper downloads `large-v3-turbo` each time. In test 2 that was
+about 10 s of Whisper's 14 s start. The same fix as the LLM's Step A applies:
+download the model during the image build.
+
+### CPU speed varies between containers, and in-process TTS feels it
+The two sessions ran identical code on identical `cpu=4` containers, yet
+Kokoro ran at **27–52 ms per character** in the first and **13–14 ms per
+character** in the second (the benchmark gave 14). The slow container was
+slow from its first turn; it didn't degrade. Modal's `cpu` setting reserves
+CPU time but not a particular CPU type.
+
+### The bot's audio breaks up, cause not yet known
+The user heard the bot "breaking up" in **both** sessions. The second ran on
+the fast container, so slow CPU is at most a contributing factor, not the
+cause. The server logs show no warnings and each reply plays as one
+continuous stretch, so the server side gives no clue.
+
+Remaining candidates: network loss or jitter between the browser and Modal
+(us-east, direct UDP via STUN, no TURN relay), or the pacing of audio sent
+by the Python WebRTC stack (aiortc). Next step: capture
+`chrome://webrtc-internals` during a session. Packet loss, jitter, and
+concealed samples on the incoming audio separate a network problem from a
+server one.
 
 ### Scale-to-zero returns 503 instead of waiting
 A request to a `modal.server` app with no running container starts one, but
@@ -183,11 +442,33 @@ Swahili is a separate question.
   which stage a failure is in.
 - **Verifying pins.** `pip freeze` run inside each built image, to pin the
   versions actually running rather than guessing.
+- **A per-turn latency table from logs.** `tools/turn_latency.py` reads the
+  bot's log (`modal app logs ... --since 30m --tail 20000 > file`) and groups
+  events into turns: VAD segments, transcripts, turn end, Pipecat TTFB
+  metrics, and "Bot started speaking". It produced the latency tables above.
+  Pipecat's metrics are per stage only, so end-to-end delay has to be
+  rebuilt from timestamps like this. Catch: `modal app logs --since` reads an
+  absolute time as *local* time; relative values (`30m`) are safer.
+- **Comparing containers, not just turns.** Splitting TTS speed by session
+  (ms per character) is what showed the CPU difference between containers.
+  Averaged over the whole run it just looked like "TTS is sometimes slow".
 
 ## Next
 
-1. Measure end-to-end latency over 10–20 turns, plus cold-start time.
+1. Fixes found in the measured sessions, each re-measured with the same
+   scripts:
+   - Cold start, Step B: the remaining `torch.compile` (~55–60 s) and imports
+     (~50 s); then a full end-to-end cold test after the LLM scales to zero.
+   - Whisper: download the model during the image build.
+   - Smart-turn fallback: lower `stop_secs` from 3 s and compare.
+   - Long sentences: a longer Kokoro `stop_frame_timeout_s`, and shorter
+     replies.
+   - Barge-in: test with headphones, then a lower VAD `start_secs`.
+   - Choppy audio: capture `chrome://webrtc-internals` during a session.
+   - Put today's date in the system prompt; web search for recent facts
+     later.
+   - A warm pool of bot containers, to cut session start.
 2. Build the same assistant with LiveKit Agents against the same STT and LLM
    servers, and compare it with this one on the measurements above.
-3. Swahili and code-switching: a stronger LLM for Swahili, a Swahili-capable
-   TTS, and language-switching rules.
+3. Multilingual support and code-switching: a stronger LLM beyond English, a
+   multilingual TTS, and language-switching rules.
