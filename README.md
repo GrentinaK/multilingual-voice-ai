@@ -12,7 +12,9 @@ baseline**: the open models for other languages weren't good enough yet (see
 in English first.
 
 Everything learned along the way (what broke, why, and what it cost in
-seconds) is in [FINDINGS.md](FINDINGS.md).
+seconds) is in [FINDINGS.md](FINDINGS.md). For a full walkthrough of the
+code (every file, how they connect, and what each library does) see
+[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md).
 
 ## How it works
 
